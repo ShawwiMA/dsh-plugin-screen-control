@@ -1,0 +1,9 @@
+# 只钉通道，不钉具体版本号。
+#
+# 原因：本机没有 Rust 工具链，我无法验证任何一个具体 patch 版本是否真的存在、
+# 是否已 yanked。写死一个可能不存在的版本号会让 `rustup` 直接失败，而 "stable"
+# 一定能解析。如果后续要复现构建，把下面这行换成确切的 stable 版本号即可。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

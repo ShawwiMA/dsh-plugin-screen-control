@@ -1,0 +1,74 @@
+{
+  "name": "dsh-plugin-screen-control",
+  "version": "0.2.4",
+  "description": "DSH 屏幕操控插件：TypeScript 薄壳 + Rust 常驻引擎。观察与操作后台窗口，不激活前台窗口。",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
+    "sync-engine": "node scripts/sync-engine.mjs",
+    "check-engine": "node scripts/sync-engine.mjs --check",
+    "selfcheck": "node scripts/selfcheck.mjs",
+    "acceptance": "node scripts/acceptance.mjs",
+    "build:testbed": "gcc -O2 -mwindows -o scripts/testbed-window.exe scripts/testbed-window.c -luser32 -lgdi32",
+    "link": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/link-into-profile.ps1",
+    "prepack": "node scripts/sync-engine.mjs --check"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "screen-control",
+    "ui-automation",
+    "computer-use",
+    "windows",
+    "rust"
+  ],
+  "author": "ShawwiMA",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShawwiMA/dsh-plugin-screen-control.git"
+  },
+  "homepage": "https://github.com/ShawwiMA/dsh-plugin-screen-control#readme",
+  "bugs": {
+    "url": "https://github.com/ShawwiMA/dsh-plugin-screen-control/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh": "^0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "file:../../profiles/node_modules/@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-tools": "file:../../profiles/node_modules/@deepseek-ai/dsh-tools",
+    "@types/node": "^24",
+    "typescript": "^5"
+  }
+}

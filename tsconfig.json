@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "exactOptionalPropertyTypes": false,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "declaration": false,
+    "outDir": "lib",
+    "rootDir": "src",
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/cordis": ["../../../.dsh/profiles/node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-tools": ["../../../.dsh/profiles/node_modules/@deepseek-ai/dsh-tools/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-tools/*": ["../../../.dsh/profiles/node_modules/@deepseek-ai/dsh-tools/lib/types/*"],
+      "@deepseek-ai/dsh-llm/*": ["../../../.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/*"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

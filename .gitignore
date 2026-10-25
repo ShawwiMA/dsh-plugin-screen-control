@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+
+# Rust 编译产物（target/ 和 target-uia/ 都是，共几 GB，绝不能进仓库）
+rust-engine/target*/
+
+
+# 本地运行时产物
+logs/
+backups/
+*.log
+
+# 文件写入铁律产生的备份
+*.bak-*
+!*.bak.md
+
+# 测试窗口的编译产物
+scripts/testbed-window.exe
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

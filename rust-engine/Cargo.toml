@@ -1,0 +1,94 @@
+[package]
+name = "dsh-screen-control-engine"
+version = "0.2.4"
+edition = "2024"
+# edition 2024 要求 rustc >= 1.85；这里只声明下限，不含上限。
+# 实际建议用 stable 通道（见 rust-toolchain.toml）。
+rust-version = "1.85"
+description = "DSH screen-control 常驻引擎：命名管道 + Windows 窗口捕获/观察/投递输入"
+license = "MIT"
+publish = false
+
+[dependencies]
+# 版本号来自 docs.rs 的 crates.io 元数据（2026-10 查询），非凭记忆填写。
+tokio = { version = "1.53.3", features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+parking_lot = "0.12.5"
+thiserror = "2.0.21"
+# 只用 PNG 编码 + RGBA8 缓冲，关掉默认的 jpeg/webp/ravif 等编解码器，
+# 既能砍掉一大半依赖，也避免 rayon 在 GUI 进程里起线程池。
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+# features 逐个列全：漏一个就会在编译期报 "cannot find function/constant"。
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    # win_web_cdp 生成 Sec-WebSocket-Key 要用系统 CSPRNG（BCryptGenRandom）。
+    "Win32_Security_Cryptography",
+    # win_type auto 模式的自动剪贴板：OpenClipboard/EmptyClipboard/SetClipboardData 在
+    # DataExchange，GlobalAlloc/GlobalLock/GlobalFree 在 Memory。
+    # 只是给已在依赖里的 windows-sys 开 feature，不新增任何 crate。
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+# win_ocr / win_wait(text)：Windows.Media.Ocr（WinRT 原生 OCR）。
+# 可选依赖 + 默认 feature 打开：关掉时（--no-default-features）win_ocr 返回
+# UNSUPPORTED，其余功能不受影响；打开时用的是系统自带 OCR，不自己搓引擎。
+# 0.62.2 与 uiautomation 自带的那份 windows 一致，且已在 Cargo.lock 里。
+windows = { version = "0.62.2", optional = true, features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+] }
+
+# 真 UIA 路径：默认不编译。启用方式 cargo build --features uia。
+# uiautomation 自带 windows 0.62 二进制层，和上面的 windows-sys 互不干扰。
+uiautomation = { version = "0.25.1", optional = true }
+
+[features]
+default = ["ocr"]
+# ocr = Windows.Media.Ocr 文字识别（win_ocr / win_wait 的 text 条件）。
+ocr = ["dep:windows"]
+# uia = 真 UI Automation 元素树（阶段二）。阶段一默认走 EnumChildWindows。
+uia = ["dep:uiautomation"]
+
+# 二进制名必须和 TS 侧约定一致：src/bridge.ts 的 ENGINE_EXE 常量和
+# scripts/build-engine.ps1 找的都是 screen-control-engine.exe。
+# Cargo 默认拿**包名**当二进制名，而包名带了 `dsh-` 前缀，
+# 不显式指定的话产物会叫 dsh-screen-control-engine.exe，TS 侧永远找不到它。
+[[bin]]
+name = "screen-control-engine"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# uia 版本专用：uiautomation 0.25 内部有 unwrap，目标进程无响应时会 panic。
+# 默认 release 的 panic="abort" 会让引擎进程当场消失，所以 uia 版本单独给它
+# unwind，配合 src/uia.rs 里的 catch_unwind，把"某个窗口查不动"降级成
+# 一次失败的调用 + 回退 child_window，而不是引擎猝死。
+# 构建方式: cargo build --profile release-uia --features uia
+[profile.release-uia]
+inherits = "release"
+panic = "unwind"

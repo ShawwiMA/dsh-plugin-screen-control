@@ -1,0 +1,16 @@
+# ============================================================================
+# dsh-plugin-screen-control —— bundle 挂载声明
+# ============================================================================
+# 从 npm 安装(推荐):
+#   dsh plugin --profile desktop add dsh-plugin-screen-control
+#
+# 从本地目录安装:
+#   dsh plugin --profile desktop add link:/绝对路径/dsh-plugin-screen-control
+#
+# 本文件由 profile 在 bundle 层之后应用，把插件挂进 cordis 插件树。
+# 安装后若工具没出现，重启 dsh web 即可。
+# ============================================================================
+
+- insert:
+    - id: screen-control
+      name: dsh-plugin-screen-control
