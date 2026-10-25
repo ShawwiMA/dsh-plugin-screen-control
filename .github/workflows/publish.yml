@@ -1,0 +1,39 @@
+name: Publish
+
+# 由 npm 的 OIDC 可信发布（Trusted Publisher）驱动，不需要任何长期 token。
+# 发版流程：改 package.json 版本 → 提交 → 打 tag 并推送 → 这个 workflow 自动发布。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC 必需：用它向 npm 换取一次性发布凭证
+
+jobs:
+  publish:
+    name: 发布到 npm
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # 可信发布要求 npm CLI >= 11.5.1，node 24 自带的版本不一定够，统一升到 latest。
+      - name: 升级 npm
+        run: npm install -g npm@latest
+
+      - name: 引擎版本守卫
+        run: node scripts/sync-engine.mjs --check
+
+      - name: 发布包体检
+        run: node scripts/verify-pack.mjs
+
+      # 不带 NODE_AUTH_TOKEN：OIDC 会在这一步自动换凭证。
+      - name: 发布
+        run: npm publish --provenance
