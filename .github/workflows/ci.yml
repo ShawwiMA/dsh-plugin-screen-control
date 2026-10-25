@@ -1,0 +1,20 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  package:
+    name: 发布包体检
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 引擎版本守卫
+        run: node scripts/sync-engine.mjs --check
+
+      - name: 发布包内容体检
+        run: node scripts/verify-pack.mjs
