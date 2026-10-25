@@ -56,6 +56,10 @@ Windows 桌面操作插件：TypeScript 薄壳（`lib/index.js`）+ Rust 常驻�
 
 **操作流水**（最新在最上面）
 
+- 2026-10-25 22:45 | 查「滚网页一滚到底」：`win_scroll` 单位错位，改工具描述 | 成功 | ~15min | ①**delta 单位是「格」不是 Windows 原始增量**（引擎 `notches = delta.clamp(-100,100)`，每格发一个 ±120 wheel 事件），实测 -3 → 记事本顶行 001→010 即**位移 9 行**（Windows 默认一格 3 行）；②旧描述写「一格 120，-360 = 3 格」，模型传 -360 被引擎当成 **360 格**、clamp 成 100 格，长网页直接冲到底、中间内容全跳过——**描述和实现的单位差 120 倍**；③**大 delta 自己也不可靠**：一次 SendInput 塞 100 个 wheel 事件，记事本只生效 28 行（≈9 格）且耗时 463ms（3 格仅 42ms），应用会丢事件；④已改 `src/index.ts` 描述为「单位是格，一次 1~5 格，别传 120 的倍数」，**改动要重启 dsh web 才对模型生效**；⑤排查手法：开记事本 + 200 行文本滚完比对顶行行号，比滚用户正在用的浏览器安全。
+
+- 2026-10-25 22:40 | npm 网页建 granular token 并发布 dsh-qq-gateway@1.0.0 | 成功 | ~45min | 坑点：① 令牌页 `/tokens/granular-access-tokens/new` 直达/刷新会白屏只显示列表，须从 Access Tokens 点「生成新令牌」并等 hydration（约 5s）；② 表单校验失败会整页重置，**Bypass 2FA 勾选会丢**，必须最后勾且勾完别再动其他控件；③ 只勾 bypass 不够，Packages and scopes 不选包范围报 "must select at least one package"，Organizations 选了 Read and write 但无组织报 "at least one organization"，要改回 No access；④ 用 token 发布前先 `curl -H "Authorization: Bearer <t>" https://registry.npmjs.org/-/npm/v1/tokens` 看 `bypass_2fa`，false 必 EOTP（token 元数据里 scopes name=null 表示全包可写）；⑤ 首次发布出现 `0.0.0-stage` 是 npm staged publishing 占位 stub，1~2 分钟后真实版本才出现在 dist-tags；⑥ 装新包报 notarget 是 npm 本地缓存旧 packument，加 `--prefer-online --cache <新目录>`；⑦ Edge 下 `win_capture` 用 printwindow 正常、bitblt 全白；显式 `ocr:true` 让引擎崩 `0xC0000005` 两次（重启后 shot_id 从头计数，旧 shot 失效），OCR 尽量别用；⑧ DSH 窗口最小化约 2 分钟后会自己弹回前台，点浏览器前若又被盖住就再 minimize 一次。
+
 - 2026-10-25 12:25 | 画图 v4：11 色量化重画（想用更多色阶救渐变），结果**不如 8 色版**，结论已定性 | 失败（有收获） | ~50min | 数据：①11 色（9 个自定义色 + 白）出 165 环 / 43044 px，黑色拦水坝 51s + 灌色 125 次 + 各色重描 51s；②验收：对 11 色目标图平均误差 **19.1**、完全一致 83.2%；对**原图**平均误差 22.5 / 中位 5 / >40 占 14.0%，三项都比 8 色版（17.0 / 6 / 8.3%）差；③根因不是颜色不够，是 **1px 边界的抖动**：白缝 5125px（227 块）与「目标白却画成彩」5386px 双向对等，说明边界整体在斜边上偏 1px；色阶越多边界总长越长，抖动损失盖过了渐变收益；④修法（未做）：RDP 别削台阶角（`RDP_EPS=0` 保留像素角点整数坐标），让铅笔严格踩在边界像素上；代价点数×2、绘制时间×2；⑤**坑：新开 mspaint 实例后自定义色板清空**，得重新逐个灌 9 个色（4 次调用/色：点彩虹+ →双击 hex 框 → 打字 → 点确定）；其中一次静默失败（色没进色板），必须回读采样色板行核对，别信"点过了"；⑥`win_window_state restore` 对**已关闭**的 mspaint 返回"窗口不存在"，要 `win_list_windows{process_name:"mspaint"}` 先确认；⑦细到无法灌色的色块（dt<3，本例仅 0.6%）生成脚本 `Temp/repair_smalls.py`，沿主方向排线后 1px 笔补画。
 - 2026-10-25 01:15 | 画图 v3：8 色量化 + 色块边界环（marching squares 像素边）+ 油漆桶灌色，新建 610×610 画布重画女仆像 | 成功 | ~45min | 数据：①247 个边界环 / 48629 屏幕像素，1px 铅笔描一遍 63s；灌色 115 次（只填离边界 ≥3px 的色块，覆盖 98.5% 面积）约 40s；再按各色重描一遍 63s；最终对 8 色目标图**平均误差 11.6、90.2% 像素完全一致**（旧扫描线法 74.8）；②**坑：描边色绝不能等于任何灌色色**——同色线会被桶顺着穿过去，第一次用 #F1F2FB 描边时灌色把整片头发染浅（命中率剩 10%）；正解＝第一遍全部用**黑色**描边当拦水坝，灌完色再按各色块重描一遍；③**坑：灌色种子必须离边界 ≥3px**（plan 里存了 `d`），1px 坐标误差就会点到隔壁色块、把大块染错；④画布坐标标定：mspaint 100% 时 **x 轴 1:1（origin 975）、y 轴有 0.3% 压缩**（`y=596.72+0.99714×doc`），标定法＝点 4 个已知文档坐标的像素→截图取色反算，两轴分别拟合；⑤`win_image_trace` 直接走工具会把整份 strokes JSON 灌进上下文（93KB 溢出），批量请求一律走 `dev-probe.mjs --file`；⑥引擎只认 png，jpg 参考图先转。
 
@@ -138,6 +142,11 @@ Windows 桌面操作插件：TypeScript 薄壳（`lib/index.js`）+ Rust 常驻�
 13. **锚点模板制作法**：`win_capture region=... max_dim=0` 裁出来就是原始像素小图，直接存 `anchors/`
     即可，不用截整屏再剪。裁前先 minimize DSH 并确认游戏前台；模板要避开会变的部分
     （如小红点/数字），只取稳定的 UI 底色+文字。
+14. **Edge/Chromium 窗口**：`win_capture` 只能用 `printwindow`（`bitblt` 出全白）；**别开 `ocr:true`**——
+    实测连续两次把引擎打崩（`code=0xC0000005`），重启后 `shot_id` 从 1 重新计数、旧 shot 全部失效。
+    网页表单操作靠「截图→read_image 量坐标→shot_id 点击」即可，别依赖 UIA（Chrome 只暴露 Legacy Window）。
+    另外 DSH 主窗最小化后约 2 分钟会自己弹回前台（Electron 行为），点网页前先 `win_list_windows` 确认
+    目标窗口 `is_foreground`，被盖住就再 minimize 一次；`win_click` 的「被…盖住」拒绝就是判据。
 14. **引擎 release 是 Windows GUI 子系统**：PowerShell 里 `& exe ...` 拿不到 stdout/退出码
     （`$LASTEXITCODE` 为空），必须用 .NET `ProcessStartInfo` 重定向；bash / node 管道正常。
     `zzz-daily.ps1` 的 `Invoke-EngineRaw` 已按此实现（2026-10-18 脚本自检报"不支持 find"就是它）。

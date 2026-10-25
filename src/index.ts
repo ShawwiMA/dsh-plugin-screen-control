@@ -319,12 +319,19 @@ export function apply(ctx: Context): void {
       description:
         '在指定位置滚轮滚动。走 SendInput 真注入:会短暂移动真实光标(结束后还原)、' +
         '并激活滚动位置的窗口(Windows 的语义:滚轮事件发给光标下的窗口)。' +
-        'delta 为正向上滚、为负向下滚,一个刻度是 120(例如 -360 表示向下滚 3 格)。',
+        'delta 的单位是"格"(一次滚轮刻度,通常相当于 3 行文字):正数向上滚、负数向下滚。' +
+        '传 -3 就是向下滚 3 格。不要传 120、360 这类数字——那是 Windows 的滚轮原始增量单位,' +
+        '不是这个参数的单位,传 360 会滚 360 格直接冲到底并被截断到 100 格。' +
+        '要看长页面中间的内容,一屏一屏滚:一次 3~5 格,滚完截图确认再继续。',
       parameters: {
         snapshot_id: { type: 'integer', description: 'win_observe 的快照 id。' },
         uid: { type: 'integer', description: '滚动目标元素的 uid;不给则用窗口中心。' },
         hwnd: { type: 'integer', description: '目标窗口句柄;不用 snapshot_id 时必填。' },
-        delta: { type: 'integer', required: true, description: '滚轮增量,一格 120;负数向下滚。' },
+        delta: {
+          type: 'integer',
+          required: true,
+          description: '滚轮格数,一格约 3 行文字。负数向下滚、正数向上滚。建议一次 1~5 格,不要传 120 的倍数。',
+        },
         x: { type: 'integer', description: '滚动位置 X(屏幕物理像素);不给则用窗口中心。' },
         y: { type: 'integer', description: '滚动位置 Y(屏幕物理像素);不给则用窗口中心。' },
         shot_id: { type: 'integer', description: '截图坐标:x/y 按该截图的像素解释。' },
