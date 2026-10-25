@@ -44,7 +44,7 @@ TypeScript 薄壳负责注册工具、校验参数、转发请求；Rust 常驻�
 | `win_click` | 点击。可用 `snapshot_id` + `uid` 精确定位，也可直接给屏幕坐标；走真实输入注入。 |
 | `win_type` | 输入文本。纯 ASCII 走 Unicode 注入；中文等非 ASCII 自动走剪贴板；密码框直接拒绝。 |
 | `win_press` | 发送按键或组合键，例如 Enter、Tab、Esc、方向键、F1 到 F12，可带 Ctrl、Alt、Shift、Win。 |
-| `win_scroll` | 在指定位置滚轮滚动，一格 120，负数向下。 |
+| `win_scroll` | 在指定位置滚轮滚动。`delta` 单位是格（一格约 3 行文字），负数向下、正数向上，建议一次 1~5 格。 |
 | `win_drag` | 单段拖拽：按下、插值移动、抬起，带 1px 微动；适合拖标题栏、拖选文本、拖滑块。 |
 | `win_drag_path` | 一次按下走完整条路径，支持圆、圆弧、贝塞尔、折线和多笔；绘制曲线、签名用这个，不要用 `win_drag` 拼段。 |
 | `win_record` | 录一段人手的鼠标轨迹，返回带毫秒时间戳的笔顺，交给 `win_drag_path` 按原速回放。 |
