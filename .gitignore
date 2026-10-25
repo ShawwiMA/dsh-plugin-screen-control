@@ -21,3 +21,6 @@ scripts/testbed-window.exe
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# npm pack 产物
+*.tgz
