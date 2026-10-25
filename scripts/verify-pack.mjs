@@ -24,6 +24,21 @@ const fail = (m) => {
 };
 const check = (cond, okMsg, badMsg) => (cond ? pass(okMsg) : fail(badMsg));
 
+// 从混着其他输出的文本里捞出第一段能解析的 JSON。
+// prepack 脚本的日志、npm notice 都可能混在 stdout 前面。
+function extractJson(text) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== '{' && ch !== '[') continue;
+    try {
+      return JSON.parse(text.slice(i));
+    } catch {
+      // 不是这里开头，继续往后找
+    }
+  }
+  return undefined;
+}
+
 // ---- 1. 发布字段 ----
 console.log('=== 发布字段 ===');
 check(pkg.private === undefined, 'package.json 已不是 private', 'package.json 还是 private，npm publish 会被拒');
@@ -42,8 +57,12 @@ try {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const json = JSON.parse(out.slice(out.indexOf('{')));
-  info = json[pkg.name] ?? Object.values(json)[0];
+  // npm 12 的 `pack --json` 输出单个对象，npm 11 及更早输出数组，两种都要认。
+  // 另外 prepack 脚本自己的 stdout 会混进来，所以从每个 `{` / `[` 依次试着解析。
+  const parsed = extractJson(out);
+  if (!parsed) throw new Error('npm pack 的输出里找不到可解析的 JSON');
+  info = Array.isArray(parsed) ? parsed[0] : (parsed[pkg.name] ?? Object.values(parsed)[0]);
+  if (!info || !Array.isArray(info.files)) throw new Error(`npm pack 的 JSON 结构不认识：${JSON.stringify(parsed).slice(0, 120)}`);
 } catch (e) {
   fail(`npm pack 失败：${e.message}`);
   process.exit(1);
