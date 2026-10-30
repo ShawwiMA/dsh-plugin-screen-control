@@ -146,7 +146,12 @@ pub fn finish(b: Baseline) -> EffectResult {
             let (Some(base), Some(region)) = (b.img.as_ref(), b.region) else {
                 return skipped(b.mode, b.region, warnings, "基准图缺失".to_string());
             };
-            let threshold = b.params.threshold.unwrap_or(defaults::EFFECT_THRESHOLD).clamp(0.0, 1.0);
+            // threshold 允许 0，但 0 不能等于"永远生效"：比值本身也可能是 0。
+            // 非有限值（NaN/inf）一律退回默认阈值，不要让比较悄悄失效。
+            let threshold = match b.params.threshold {
+                Some(t) if t.is_finite() => t.clamp(0.0, 1.0),
+                _ => defaults::EFFECT_THRESHOLD,
+            };
             let mut capture_failed = false;
             loop {
                 polls += 1;
@@ -154,7 +159,7 @@ pub fn finish(b: Baseline) -> EffectResult {
                     Ok(img) => {
                         let ratio = diff_ratio(&base.rgba, &img.rgba);
                         best_diff = best_diff.max(ratio);
-                        if ratio >= threshold {
+                        if effect_reached(ratio, threshold) {
                             return EffectResult {
                                 checked: true,
                                 changed: true,
@@ -217,6 +222,14 @@ fn skipped(mode: VerifyMode, region: Option<Rect>, mut warnings: Vec<String>, wh
         detail: None,
         warnings,
     }
+}
+
+/// 判定"这次动作算不算生效"。
+///
+/// 单独抽出来是为了能被单测覆盖：阈值给 0 时旧写法 `ratio >= 0` 恒真，
+/// 一次什么都没改变的点击也会报"已生效"。
+fn effect_reached(ratio: f64, threshold: f64) -> bool {
+    ratio > 0.0 && ratio >= threshold
 }
 
 /// 比对两张同尺寸 RGBA 图的差异比例。
@@ -329,6 +342,15 @@ mod tests {
         }
         // 每 24 字节（2 个取样点）改 1 个 → 0.5
         assert!((diff_ratio(&a, &b) - 0.5).abs() < 1e-9, "{}", diff_ratio(&a, &b));
+    }
+
+    #[test]
+    fn zero_threshold_does_not_count_as_changed() {
+        // 阈值给 0 时，"完全没有变化"必须判否；有任何变化才算通过。
+        assert!(!effect_reached(0.0, 0.0));
+        assert!(effect_reached(0.01, 0.0));
+        assert!(effect_reached(0.5, 0.2));
+        assert!(!effect_reached(0.1, 0.2));
     }
 
     #[test]

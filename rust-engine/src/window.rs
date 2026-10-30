@@ -7,7 +7,7 @@
 //! 会造出大量碎片窗口，如果不过滤，`win_list_windows` 一屏能返回几百条噪音。
 //! 规则见 [`is_top_level_candidate`]。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use parking_lot::RwLock;
@@ -21,11 +21,11 @@ use windows_sys::Win32::System::Threading::{
 // 不在 WindowsAndMessaging 里——放错模块就是 E0432。
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CWP_ALL, CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumChildWindows, EnumWindows, GA_ROOT,
-    GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW, GetParent, GetWindowLongW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WindowFromPoint,
+    CWP_ALL, CWP_SKIPINVISIBLE, ChildWindowFromPointEx, EnumWindows, GA_ROOT, GWL_EXSTYLE,
+    GWL_STYLE, GW_CHILD, GW_HWNDNEXT, GetAncestor, GetClassNameW, GetParent, GetWindow,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, WS_CHILD, WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowFromPoint,
 };
 
 use crate::dpi;
@@ -274,37 +274,65 @@ pub struct ChildWalk {
 pub fn enum_children_bfs(root: HWND, max_depth: u32, max_elements: usize) -> ChildWalk {
     let mut result: Vec<(HWND, u32)> = Vec::new();
     let mut truncated = false;
-    // 队列保存 (父窗口, 该父窗口的层级)。根窗口层级为 0，其子为 1。
-    let mut queue: Vec<(HWND, u32)> = vec![(root, 0)];
+    // 真正的 BFS 用 VecDeque + pop_front：用 Vec::pop 是 LIFO（深度优先），
+    // 那样 result 里会先出现一整条深链再回头，既不符合「(深度, Z 序)」的返回契约，
+    // 也会让 max_elements 先被某个深层子树吃光。
+    let mut queue: VecDeque<(HWND, u32)> = VecDeque::new();
+    queue.push_back((root, 0));
+    // 去重：被 hook 过的窗口可能给出「同一个子窗口挂在两个父节点下」的假树，
+    // 或者 sibling 链成环。按 hwnd 去重后，同一元素不会被重复返回、也不会死循环。
+    let mut seen: HashSet<usize> = HashSet::new();
+    seen.insert(to_u64(root) as usize);
 
-    while let Some((parent, depth)) = queue.pop() {
+    while let Some((parent, depth)) = queue.pop_front() {
+        let children = direct_children(parent);
+        if children.is_empty() {
+            continue;
+        }
         if depth >= max_depth {
             // 还能再往下但被 max_depth 挡住，如实标记截断。
-            if direct_children(parent).is_empty() {
-                continue;
-            }
             truncated = true;
             continue;
         }
-        for child in direct_children(parent) {
+        for child in children {
             if result.len() >= max_elements {
                 truncated = true;
                 break;
             }
+            if !seen.insert(to_u64(child) as usize) {
+                continue;
+            }
             result.push((child, depth + 1));
-            queue.push((child, depth + 1));
+            queue.push_back((child, depth + 1));
         }
     }
 
     ChildWalk { windows: result, truncated }
 }
 
-/// 直接子窗口列表（一层）。
+/// 直接子窗口列表（只有一层）。
+///
+/// 为什么不用 EnumChildWindows：它枚举的是整棵子树（含孙窗口），拿来做「下钻一层」
+/// 会把孙辈当成子辈，再被子窗口遍历重复枚举一遍 —— 结果是控件重复、depth 错乱、
+/// 节点预算被同一批窗口吃掉两遍。GetWindow(GW_CHILD) + GW_HWNDNEXT 才是 Win32
+/// 里「直接子窗口」的正解，顺序同样是 Z 序（最前 -> 最后）。
 pub fn direct_children(parent: HWND) -> Vec<HWND> {
+    // 防御性上限：被 hook 过的窗口可能给出环形 sibling 链，宁可截断也不死循环。
+    const MAX_SIBLINGS: usize = 65_536;
     let mut out: Vec<HWND> = Vec::new();
-    let ctx = &mut out as *mut Vec<HWND> as LPARAM;
-    // SAFETY: 回调只 push；ctx 指向栈上 Vec，同步回调期间有效且无别名。
-    unsafe { EnumChildWindows(parent, Some(collect_enum_proc), ctx) };
+    if parent.is_null() {
+        return out;
+    }
+    // SAFETY: GetWindow 是纯查询；parent 由调用方保证是有效窗口。
+    let mut child = unsafe { GetWindow(parent, GW_CHILD) };
+    while !child.is_null() {
+        out.push(child);
+        if out.len() >= MAX_SIBLINGS {
+            break;
+        }
+        // SAFETY: 同上；GW_HWNDNEXT 沿同级兄弟链前进。
+        child = unsafe { GetWindow(child, GW_HWNDNEXT) };
+    }
     out
 }
 
@@ -332,15 +360,18 @@ pub fn count_descendants(root: HWND, cap: usize) -> usize {
 /// `CWP_SKIPINVISIBLE` 不能省——隐藏的子窗口往往覆盖在可见控件之上，
 /// 命中了它们等于把消息投进了黑洞。
 pub fn deepest_child_at(root: HWND, screen_x: i32, screen_y: i32) -> HWND {
-    let (cx, cy) = match dpi::screen_to_client(root, screen_x, screen_y) {
-        Ok(v) => v,
-        Err(_) => return root,
-    };
-
     let mut current = root;
     // 逐层下钻。设一个硬上限，防止自引用/环形父子关系导致死循环
     // （Win32 理论上不该有环，但被 hook 过的窗口不保证）。
     for _ in 0..64 {
+        // 关键：ChildWindowFromPointEx 收的是「current 自己的客户区坐标」。
+        // 每下钻一层，坐标系就换一次父窗口（子窗口的客户区原点相对父窗口有偏移），
+        // 必须用当前层的 current 重新换算；沿用第一层的换算结果会在第二层起歪掉，
+        // 命中错控件。
+        let (cx, cy) = match dpi::screen_to_client(current, screen_x, screen_y) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
         // SAFETY: current 是有效窗口（起点 root 由调用方校验，后续来自
         // 上一轮 ChildWindowFromPointEx 的返回值）；point 是栈上 POINT；
         // CWP_ALL 表示不做额外过滤，可见性由我们自己在下一轮判断。
@@ -672,5 +703,182 @@ pub fn z_order_of(hwnd: HWND) -> i32 {
     match enum_top_level() {
         Ok(all) => all.iter().position(|&h| h == hwnd).map(|i| i as i32).unwrap_or(-1),
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod child_tree_tests {
+    //! 真窗口回归测试（审查第 02、03、11 条）：直接建一个父子窗口树，验证
+    //! 「只取一层」「BFS 深度/Z 序」「去重」「逐级坐标换算」。
+    //!
+    //! 为什么不能只测纯函数：这几个缺陷的共同点就是"逻辑看着对、落到真实
+    //! HWND 关系上才错"，所以这里用 CreateWindowEx 建真窗口来跑。
+
+    use super::*;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HINSTANCE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
+        SW_SHOWNOACTIVATE, ShowWindow, WNDCLASSW, WS_CHILD, WS_OVERLAPPED, WS_VISIBLE,
+    };
+
+    static CLASS: OnceLock<bool> = OnceLock::new();
+
+    extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
+        // SAFETY: 默认窗口过程对任意消息都安全；参数由系统传入。
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn class_name() -> Vec<u16> {
+        "DshScreenControlTestWindow\0".encode_utf16().collect()
+    }
+
+    /// 注册一次窗口类；返回类名（带结尾 NUL）。
+    fn ensure_class() -> Vec<u16> {
+        CLASS.get_or_init(|| {
+            let name = class_name();
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: std::ptr::null_mut(),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: name.as_ptr(),
+            };
+            // SAFETY: wc 里的类名指针在调用期间有效；注册失败返回 0（类可能已被别的
+            // 测试注册过，此时同样可以创建窗口）。
+            unsafe { RegisterClassW(&wc) };
+            true
+        });
+        class_name()
+    }
+
+    fn create(parent: HWND, x: i32, y: i32, w: i32, h: i32, style: u32) -> HWND {
+        let name = ensure_class();
+        let title: Vec<u16> = "test\0".encode_utf16().collect();
+        // SAFETY: 参数都是纯数值 / 有效指针；创建失败返回空句柄由调用方断言。
+        unsafe {
+            CreateWindowExW(
+                0,
+                name.as_ptr(),
+                title.as_ptr(),
+                style,
+                x,
+                y,
+                w,
+                h,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut::<std::ffi::c_void>() as HINSTANCE,
+                std::ptr::null(),
+            )
+        }
+    }
+
+    struct Tree {
+        parent: HWND,
+        a: HWND,
+        b: HWND,
+        a_child: HWND,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let parent = create(
+                std::ptr::null_mut(),
+                100,
+                100,
+                400,
+                300,
+                WS_OVERLAPPED | WS_VISIBLE,
+            );
+            assert!(!parent.is_null(), "父窗口创建失败");
+            // 子窗口 A、B：同一层；A 内部再挂一个 A1。
+            let a = create(parent, 10, 10, 120, 120, WS_CHILD | WS_VISIBLE);
+            let b = create(parent, 200, 10, 120, 120, WS_CHILD | WS_VISIBLE);
+            let a_child = create(a, 5, 5, 60, 60, WS_CHILD | WS_VISIBLE);
+            assert!(!a.is_null() && !b.is_null() && !a_child.is_null(), "子窗口创建失败");
+            // SAFETY: 窗口刚创建、句柄有效；SW_SHOWNOACTIVATE 只改可见性不抢焦点。
+            unsafe { ShowWindow(parent, SW_SHOWNOACTIVATE) };
+            Self { parent, a, b, a_child }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            // SAFETY: DestroyWindow 对有效句柄安全；子窗口随父窗口一起销毁。
+            unsafe {
+                DestroyWindow(self.parent);
+            }
+        }
+    }
+
+    fn key(hwnd: HWND) -> usize {
+        to_u64(hwnd) as usize
+    }
+
+    #[test]
+    fn direct_children_only_one_layer() {
+        with_window_station(|| {
+            let t = Tree::new();
+            let kids = direct_children(t.parent);
+            let ks: Vec<usize> = kids.iter().map(|h| key(*h)).collect();
+            assert!(ks.contains(&key(t.a)), "A 必须是直接子窗口");
+            assert!(ks.contains(&key(t.b)), "B 必须是直接子窗口");
+            assert!(!ks.contains(&key(t.a_child)), "A1 是孙窗口，不能出现在直接子窗口里");
+            assert_eq!(kids.len(), 2, "父窗口只有 A、B 两个直接子窗口");
+        });
+    }
+
+    #[test]
+    fn bfs_returns_depth_and_no_duplicates() {
+        with_window_station(|| {
+            let t = Tree::new();
+            let walk = enum_children_bfs(t.parent, 6, 100);
+            let mut seen = std::collections::HashSet::new();
+            for (hwnd, _depth) in &walk.windows {
+                assert!(seen.insert(key(*hwnd)), "同一窗口被枚举了两次: {:?}", hwnd);
+            }
+            let depth_of = |h: HWND| walk.windows.iter().find(|(w, _)| key(*w) == key(h)).map(|(_, d)| *d);
+            assert_eq!(depth_of(t.a), Some(1), "A 深度应为 1");
+            assert_eq!(depth_of(t.b), Some(1), "B 深度应为 1");
+            assert_eq!(depth_of(t.a_child), Some(2), "A1 深度应为 2");
+            // BFS 顺序：深度不递减。
+            let depths: Vec<u32> = walk.windows.iter().map(|(_, d)| *d).collect();
+            assert!(depths.windows(2).all(|w| w[0] <= w[1]), "BFS 必须以深度递增顺序返回: {depths:?}");
+        });
+    }
+
+    #[test]
+    fn deepest_child_converts_coords_each_level() {
+        with_window_station(|| {
+            let t = Tree::new();
+            // A1 客户区中心在父窗口客户区里的坐标：A(10,10) + A1(5,5) + 30
+            let (px, py) = dpi::client_to_screen(t.parent, 10 + 5 + 30, 10 + 5 + 30)
+                .expect("父窗口客户区坐标换算失败");
+            let hit = deepest_child_at(t.parent, px, py);
+            assert_eq!(
+                key(hit),
+                key(t.a_child),
+                "坐标换算必须在每一层重新做，否则命中的是 A 而不是 A1"
+            );
+        });
+    }
+
+    /// 单元测试默认跑在没有交互桌面的线程里也能创建窗口，但 CI 偶尔会跑在
+    /// 非交互 session；这时跳过而不是假红。
+    fn with_window_station(f: impl FnOnce()) {
+        let probe = create(std::ptr::null_mut(), 0, 0, 10, 10, WS_OVERLAPPED);
+        if probe.is_null() {
+            eprintln!("跳过：当前环境没有可用的窗口站（非交互 session）");
+            return;
+        }
+        // SAFETY: 探测窗口句柄有效。
+        unsafe { DestroyWindow(probe) };
+        f();
     }
 }

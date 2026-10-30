@@ -28,8 +28,16 @@ jobs:
       - name: 升级 npm
         run: npm install -g npm@latest
 
-      - name: 引擎版本守卫
-        run: node scripts/sync-engine.mjs --check
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 发布包里的 exe 必须现编：不能拿仓库 bin/ 里的旧产物发布，
+      # 否则用户装到的引擎和 tag 上的源码不是同一份。
+      - name: 编译 release 引擎
+        working-directory: rust-engine
+        run: cargo build --release
+
+      - name: 引擎版本守卫（现编现比）
+        run: node scripts/sync-engine.mjs --check --require-built
 
       - name: 发布包体检
         run: node scripts/verify-pack.mjs

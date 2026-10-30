@@ -468,3 +468,17 @@ screen-control-engine capture --out <绝对PNG路径> [--hwnd N] [--region x,y,w
 两道闸门都排在密码框判定**之后**:先看是不是密码框(`PASSWORD_FIELD`),再看能不能投递。
 **默认 `method="auto"` 走真注入**（不是 postmessage）；只有显式 `method="postmessage"` 才走 WM_CHAR、不碰前台。
 
+
+## 取消控制管道（0.2.5）
+
+引擎是**单线程串行**处理请求的：主管道在处理一个长操作（`win_drag_path` / `win_wait` /
+`win_record`）期间读不到第二条请求。所以取消走一条独立的控制管道：
+
+- 名称：主管道名 + `-ctl`（例：`\\.\pipe\dsh-screen-control-1234-abcd-ctl`）；
+- 方向：TS → 引擎，一行一个 JSON，只认 `{"cancel": <请求 id>}`；
+- 引擎侧：独立线程读取，把 id 写进取消位；长操作在自己的循环里检查"当前请求是否被取消"；
+- 取消命中后，长操作返回 `TIMEOUT`，message 以 `已取消：` 开头（IPC 契约只允许 7 个错误码，
+  不新增第 8 个）。停在安全边界：已按下的鼠标 / 键盘一定先抬起（ButtonHold / KeyHold 的 Drop）；
+- 控制管道连不上时，取消退化为旧行为（只取消调用方等待），不影响功能。
+
+TS 侧在 `signal.abort` 或调用超时时会尽力发一条取消帧。

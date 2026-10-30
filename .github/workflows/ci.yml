@@ -4,7 +4,7 @@ on: [push, pull_request, workflow_dispatch]
 
 jobs:
   package:
-    name: 发布包体检
+    name: 源码 + 发布包体检
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,8 +13,27 @@ jobs:
         with:
           node-version: 24
 
-      - name: 引擎版本守卫
-        run: node scripts/sync-engine.mjs --check
+      # Rust 侧必须有：之前 CI 完全不碰 Rust，编译错误、单测失败、引擎与源码不一致
+      # 全都能静默通过 —— 发布出来的 exe 和仓库源码对不上也没人发现。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 单元测试
+        working-directory: rust-engine
+        run: cargo test --release
+
+      - name: Rust 编译 release 引擎
+        working-directory: rust-engine
+        run: cargo build --release
+
+      # --require-built：bin/ 里的 exe 必须和刚编出来的产物逐字节一致。
+      # 没有这个开关时，CI 里 target/release 不存在 = 直接跳过比对，等于没查。
+      - name: 引擎版本守卫（现编现比）
+        run: node scripts/sync-engine.mjs --check --require-built
 
       - name: 发布包内容体检
         run: node scripts/verify-pack.mjs
+
+  # TypeScript 侧的类型检查和 selfcheck 需要 @deepseek-ai/* 的类型包，
+  # 而 devDependencies 用的是本机 file: 链接（../../profiles/node_modules/...），
+  # 在 GitHub runner 上不存在。所以这两步暂时只在本地跑，等 devDeps 换成可安装的
+  # 版本再搬进 CI。发布前请本地执行：npm run typecheck && npm run selfcheck

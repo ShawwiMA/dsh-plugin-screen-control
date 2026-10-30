@@ -105,7 +105,8 @@ dsh plugin --profile <你的profile> add link:/绝对路径/dsh-plugin-screen-co
 - **`win_type` 输入中文等非 ASCII 字符时会走剪贴板，覆盖当前剪贴板内容。** 返回值 `warnings` 会注明；不想动剪贴板可以显式传 `method:"sendinput"`。
 - **`win_click` / `win_type` 等动作会真的移动光标，也可能激活目标窗口。** 这是 Windows 的输入语义，不是无声模拟；默认注入路径抢不到前台时返回 `UNSUPPORTED`，不会硬输入到别的窗口。
 - **`bin/screen-control-engine.exe` 未做代码签名。** Windows Defender 或 SmartScreen 可能提示「未知发布者」；确认来源可信后再放行。
-- **密码框硬拒绝。** 命中 `ES_PASSWORD` 或 UIA 的 `IsPassword` 时，`win_type` 返回 `PASSWORD_FIELD`，不输入任何字符。
+- **密码框硬拒绝，但覆盖面取决于构建。** 命中 `ES_PASSWORD` 或 UIA 的 `IsPassword` 时，`win_type` 返回 `PASSWORD_FIELD`，不输入任何字符。默认构建走 `EnumChildWindows` 控件树、不编译 UIA（`--features uia` 才开），所以纯自绘界面的密码框识别不到，不要把它当安全边界。
+- **`win_web_cdp` 只连本机。** `host` / `ws_url` 里的主机名必须是回环地址；连远端浏览器请自己用 SSH 端口转发到 127.0.0.1。
 
 ## 已知限制
 

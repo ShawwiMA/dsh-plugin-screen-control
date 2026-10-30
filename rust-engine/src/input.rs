@@ -207,6 +207,8 @@ pub struct InjectionGuard {
     /// 本次是否动过光标 / 前台。没动过就不做无谓的还原，也不虚报"已还原"。
     cursor_moved: bool,
     focus_stolen: bool,
+    /// 是否已经还过现场。Drop 里靠它避免重复还原（正常路径会显式调用 restore）。
+    restored: bool,
 }
 
 impl InjectionGuard {
@@ -216,6 +218,7 @@ impl InjectionGuard {
             foreground_before: dpi::foreground_window(),
             cursor_moved: false,
             focus_stolen: false,
+            restored: false,
         }
     }
 
@@ -264,6 +267,7 @@ impl InjectionGuard {
     /// 顺序不能反：先还光标、再还前台。还前台会让原窗口激活重绘，如果那时光标还
     /// 停在目标窗口上，原窗口会收到一次假的 hover，用户看到界面闪。
     pub fn restore(&mut self) -> (bool, bool) {
+        self.restored = true;
         let cursor_ok = if self.cursor_moved {
             match self.cursor_before {
                 Some((x, y)) => {
@@ -301,6 +305,20 @@ impl InjectionGuard {
             let after = if focus_ok { "结束后已把前台还给原窗口" } else { "结束后前台未能还给原窗口，请手动确认" };
             warnings.push(format!("SendInput 真注入：为让输入落位临时激活了目标窗口，{after}"));
         }
+    }
+}
+
+impl Drop for InjectionGuard {
+    /// 兜底还现场。
+    ///
+    /// 为什么需要：注入中途任何一步返回 Err（SendInput 只提交了一部分、目标被 UIPI
+    /// 拦截、调用方提前 return）都会跳过显式的 restore，用户的光标和前台就留在被
+    /// 改动过的状态。Drop 里补一次，最坏情况是还原失败——那也只是原来的行为，不会更糟。
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        let _ = self.restore();
     }
 }
 
@@ -681,9 +699,11 @@ fn send_input_click(
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(CLICK_HOLD_MS));
         }
-        send_inputs(&[mouse_input(0, 0, 0, down_flag)])?;
+        // 用 ButtonHold 而不是裸的两次 send_inputs：抬起发出失败时 Drop 会补发一次，
+        // 不会把用户的鼠标留在按下状态。
+        let mut hold = ButtonHold::down((down_flag, up_flag))?;
         std::thread::sleep(std::time::Duration::from_millis(CLICK_HOLD_MS));
-        send_inputs(&[mouse_input(0, 0, 0, up_flag)])?;
+        hold.release()?;
     }
     Ok(())
 }
@@ -746,8 +766,8 @@ pub fn drag(
 
     let (down_flag, up_flag) = mouse_button_flags(button);
 
-    // 2) 按下。
-    send_inputs(&[mouse_input(0, 0, 0, down_flag)])?;
+    // 2) 按下。用 ButtonHold 兜底：后面任何一步失败都会在 Drop 里补发抬起。
+    let mut hold = ButtonHold::down((down_flag, up_flag))?;
 
     // 3) 轨迹插值。每一步单独提交：一次提交多个 MOVE 时，目标端可能把它们
     //    合并成一次跳跃，就失去了"连续移动"这个语义。
@@ -756,6 +776,10 @@ pub fn drag(
     let dy = to_y - sy;
     let (nx, ny) = normal_hint(dx, dy);
     for i in 1..=steps {
+        if crate::cancel::is_cancelled() {
+            // ButtonHold 的 Drop 会替我们补发抬起，所以在这里返回是安全的。
+            return Err(crate::cancel::cancelled("win_drag"));
+        }
         let t = i as f64 / steps as f64;
         let eased = smoothstep(t);
         let mut px = sx + (dx as f64 * eased).round() as i32;
@@ -774,7 +798,7 @@ pub fn drag(
 
     // 4) 松手。抬起前留一点保持时间，太快会被当成"点了一下"。
     std::thread::sleep(Duration::from_millis(CLICK_HOLD_MS));
-    send_inputs(&[mouse_input(0, 0, 0, up_flag)])?;
+    hold.release()?;
 
     let (cursor_ok, focus_ok) = guard.restore();
     guard.audit(&mut ctx.warnings, cursor_ok, focus_ok);
@@ -794,10 +818,16 @@ pub fn drag(
 
 /// 自动时长的系数：每像素 1.2ms（≈800px/s）。再快就要加大步长，否则见棱角。
 const PATH_MS_PER_PX: f64 = 1.2;
-/// 单次路径的点数上限，防止误传十万个点把引擎卡死。
+/// 重采样之后的点数上限，防止一次注入跑几分钟。
 const PATH_MAX_POINTS: usize = 20_000;
+/// 重采样之前的原始点数上限。Json 层只限制了整行字节数（16MB），
+/// 一份「几十万个点」的请求照样能塞进来；若不先卡住，重采样会在检查之前就把内存吃光。
+const PATH_MAX_RAW_POINTS: usize = 200_000;
 /// 落笔后到第一个移动之间的等待，让目标端先处理 down。
 const PATH_DOWN_SETTLE_MS: u64 = 5;
+/// 回放时间轴的硬上限（毫秒）。比 duration_ms 的上限宽，因为录制可以长很多，
+/// 但再长就该拒绝——超过这个值的 times_ms 一般不是帧数据而是坏数据。
+const PATH_MAX_REPLAY_MS: f64 = 600_000.0;
 
 #[link(name = "winmm")]
 #[allow(non_snake_case)]
@@ -861,6 +891,34 @@ fn dist(a: (i32, i32), b: (i32, i32)) -> f64 {
     (((b.0 - a.0) as f64).powi(2) + ((b.1 - a.1) as f64).powi(2)).sqrt()
 }
 
+/// 校验录制回放的时间戳：有限、非负、每笔单调不减、最长不超过硬上限。
+///
+/// 为什么在校验层拦而不是在执行层 clamp：执行层只能悄悄把坏数据改成 0ms，
+/// 那会让"回放看起来正常但速度全错"；校验层返回 false 时调用方整段退回匀速，
+/// 并在 warnings 里写明原因，至少让调用方知道这次没有按录制速度重放。
+fn times_sane(times: &[Vec<f64>], strokes: &[Vec<(f64, f64)>]) -> bool {
+    for (si, ts) in times.iter().enumerate() {
+        // 长度对不上的那几笔本来就会被忽略（见 stroke_times 的 filter），不算不合法。
+        let raw_len = strokes.get(si).map(|s| s.len()).unwrap_or(0);
+        if ts.len() != raw_len && !ts.is_empty() {
+            // 长度不匹配只是"不使用"，不进 false：调用方常见写法是给整段录制，
+            // 其中有笔少于两点被丢弃，长度自然对不上。
+            continue;
+        }
+        let mut last = 0.0_f64;
+        for t in ts {
+            if !t.is_finite() || *t < 0.0 || *t > PATH_MAX_REPLAY_MS {
+                return false;
+            }
+            if *t < last {
+                return false;
+            }
+            last = *t;
+        }
+    }
+    true
+}
+
 /// 计划表里的一步。
 #[derive(Clone, Copy)]
 enum PathStep {
@@ -885,6 +943,67 @@ pub struct PathOutcome {
     pub timed: bool,
 }
 
+/// 注入计划：每一步（Move/Down/Up）+ 累计弧长 + 可选的名义截止时刻。
+struct PathPlan {
+    plan: Vec<PathStep>,
+    cum: Vec<f64>,
+    nominal: Vec<Option<f64>>,
+    total_px: f64,
+}
+
+/// 把笔顺展开成注入计划表（纯函数，不碰 Win32，便于单测）。
+///
+/// 时间语义：`times` 是**整段录制的绝对毫秒数**（win_record 的输出），不是每笔各自
+/// 从 0 开始。所以这里直接把它当截止时刻用，**不能再累加**——旧实现把上一笔的末时间
+/// 戳叠到下一笔上，多笔轨迹的播放时长会成倍拉长、笔间间隔也不对。
+fn build_path_plan(
+    strokes: &[Vec<(i32, i32)>],
+    stroke_times: &[Option<Vec<f64>>],
+    wobble: bool,
+) -> PathPlan {
+    let mut plan: Vec<PathStep> = Vec::new();
+    let mut cum: Vec<f64> = Vec::new();
+    let mut nominal: Vec<Option<f64>> = Vec::new();
+    let mut total_px = 0.0_f64;
+    let mut prev = strokes[0][0];
+    let mut prev_ms = 0.0_f64;
+    let mut bump = |t: f64| -> f64 {
+        let t = if t.is_finite() { t.clamp(0.0, PATH_MAX_REPLAY_MS) } else { 0.0 };
+        if t > prev_ms {
+            prev_ms = t;
+        }
+        prev_ms
+    };
+    for (si, pts) in strokes.iter().enumerate() {
+        let first = pts[0];
+        if si > 0 {
+            total_px += dist(prev, first); // 抬笔移动到下一笔起点
+            prev = first;
+        }
+        let ts = stroke_times.get(si).and_then(|t| t.as_ref());
+        let at = |i: usize| -> Option<f64> { ts.map(|v| v.get(i).copied().unwrap_or(0.0)) };
+        plan.push(PathStep::Move { x: first.0, y: first.1, wob: false, travel: si > 0 });
+        cum.push(total_px);
+        nominal.push(at(0).map(&mut bump));
+        plan.push(PathStep::Down);
+        cum.push(total_px);
+        nominal.push(at(0).map(&mut bump));
+        let n = pts.len();
+        for (i, p) in pts.iter().enumerate().skip(1) {
+            total_px += dist(prev, *p);
+            prev = *p;
+            // 抖动只在"这一笔的中间点"上叠：末点要精确，不能偏。
+            let wob = wobble && i + 1 < n && i % 4 == 2;
+            plan.push(PathStep::Move { x: p.0, y: p.1, wob, travel: false });
+            cum.push(total_px);
+            nominal.push(at(i).map(&mut bump));
+        }
+        plan.push(PathStep::Up);
+        cum.push(total_px);
+        nominal.push(at(n - 1).map(&mut bump));
+    }
+    PathPlan { plan, cum, nominal, total_px }
+}
 /// 沿整条路径画：按下 → 按**弧长匀速**走完所有点 → 抬起；多笔之间自动抬笔/落笔。
 ///
 /// 和 [`drag`] 的区别：drag 只走一段直线，且每次调用都是完整的按下-抬起，
@@ -908,6 +1027,15 @@ pub fn drag_path(
     let started = Instant::now();
     let step_px = step_px.clamp(0.5, 64.0);
 
+    // 0) 先卡输入规模，再谈重采样：重采样是 O(原始点数) 的展开，先展开后检查
+    //    等于把内存交给调用方决定。
+    let raw_points: usize = strokes_in.iter().map(|v| v.len()).sum();
+    if raw_points > PATH_MAX_RAW_POINTS {
+        return Err(EngineError::invalid(format!(
+            "原始轨迹点 {raw_points} 个，超过上限 {PATH_MAX_RAW_POINTS}：减少笔数或先抽稀再传"
+        )));
+    }
+
     ensure_not_password(
         ctx.target,
         ctx.element.as_ref().map(|e| e.is_password).unwrap_or(false),
@@ -917,6 +1045,19 @@ pub fn drag_path(
     //
     // 例外：调用方给了 `times`（录制回放）时**不重采样**，因为时间戳是按原始点一一对应的，
     // 重采样会改变点数、时间戳就对不上了。回放录好的轨迹本来就是密的。
+    // times_ms 只信任「有限、非负、单调不减」的那一份；不合法就整段退回匀速，
+    // 并写进 warnings —— 静默改语义比直接报错更难查。
+    let times_valid = match times {
+        Some(t) => times_sane(t, strokes_in),
+        None => true,
+    };
+    if !times_valid {
+        ctx.warnings.push(
+            "times_ms 里存在非有限值/负数/非单调的时间戳，已整段退回匀速重放".to_string(),
+        );
+    }
+    let times = if times_valid { times } else { None };
+
     let mut strokes: Vec<Vec<(i32, i32)>> = Vec::with_capacity(strokes_in.len());
     let mut stroke_times: Vec<Option<Vec<f64>>> = Vec::with_capacity(strokes_in.len());
     let mut total_points = 0usize;
@@ -936,6 +1077,13 @@ pub fn drag_path(
         let mut pts: Vec<(i32, i32)> = Vec::with_capacity(dense.len());
         let mut kept: Vec<f64> = Vec::new();
         for (k, (x, y)) in dense.iter().enumerate() {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(EngineError::invalid(format!(
+                    "轨迹里有非有限坐标（第 {} 笔第 {} 点：({x},{y})）",
+                    si + 1,
+                    k + 1
+                )));
+            }
             let p = (x.round() as i32, y.round() as i32);
             if pts.last() == Some(&p) {
                 continue; // 同一个像素不重复发
@@ -982,51 +1130,13 @@ pub fn drag_path(
     let (down_flag, up_flag) = mouse_button_flags(button);
 
     // 4) 计划表：Move / Down / Up，每个 Move 记累计弧长（时间按弧长分配 = 匀速）。
-    //    同时按 `times` 算一份"名义时间表"（毫秒），有就按录制速度重放，没有就匀速。
-    let mut plan: Vec<PathStep> = Vec::new();
-    let mut cum: Vec<f64> = Vec::new();
-    let mut nominal: Vec<Option<f64>> = Vec::new();
-    let mut total_px = 0.0_f64;
-    let mut prev = strokes[0][0];
-    let mut clock_ms = 0.0_f64; // 多笔的时间轴游标
-    for (si, pts) in strokes.iter().enumerate() {
-        let first = pts[0];
-        if si > 0 {
-            let d = dist(prev, first); // 抬笔移动到下一笔起点
-            total_px += d;
-            prev = first;
-            clock_ms += d * PATH_MS_PER_PX;
-        }
-        let ts = stroke_times[si].as_ref();
-        let at = |i: usize| -> Option<f64> { ts.map(|v| clock_ms + v.get(i).copied().unwrap_or(0.0)) };
-        plan.push(PathStep::Move { x: first.0, y: first.1, wob: false, travel: si > 0 });
-        cum.push(total_px);
-        nominal.push(at(0));
-        plan.push(PathStep::Down);
-        cum.push(total_px);
-        nominal.push(at(0));
-        let n = pts.len();
-        for (i, p) in pts.iter().enumerate().skip(1) {
-            total_px += dist(prev, *p);
-            prev = *p;
-            // 抖动只在"这一笔的中间点"上叠：末点要精确，不能偏。
-            let wob = wobble && i + 1 < n && i % 4 == 2;
-            plan.push(PathStep::Move { x: p.0, y: p.1, wob, travel: false });
-            cum.push(total_px);
-            nominal.push(at(i));
-        }
-        plan.push(PathStep::Up);
-        cum.push(total_px);
-        nominal.push(ts.and_then(|v| v.last().copied()).map(|t| clock_ms + t));
-        if let Some(v) = ts {
-            clock_ms += v.last().copied().unwrap_or(0.0);
-        }
-    }
+    //    纯函数，单测在文件尾（多笔时间轴曾经在这里被重复累加）。
+    let PathPlan { plan, cum, nominal, total_px } = build_path_plan(&strokes, &stroke_times, wobble);
 
     // 时间模式：所有笔都有时间戳才启用；否则整段退回匀速。
     let timed = !nominal.is_empty() && nominal.iter().all(|v| v.is_some());
     let planned_ms = if timed {
-        nominal.iter().flatten().copied().fold(0.0_f64, f64::max).ceil().max(1.0) as u64
+        nominal.iter().flatten().copied().fold(0.0_f64, f64::max).ceil().clamp(1.0, PATH_MAX_REPLAY_MS) as u64
     } else {
         match duration_ms {
             Some(d) => d.clamp(20, 120_000),
@@ -1067,9 +1177,19 @@ pub fn drag_path(
     let mut max_step = 0.0_f64;
     let mut last_pos = strokes[0][0];
     let mut wobble_dir: i32 = 1;
+    // 每一笔的按下-抬起都用一个 ButtonHold 兜底：中途任何一步返回 Err，
+    // Drop 会补发抬起，绝不会把鼠标留在按下状态继续画下去。
+    let mut hold: Option<ButtonHold> = None;
 
     for (idx, step) in plan.iter().enumerate() {
-        let due = deadlines.get(idx).copied().unwrap_or(0.0).max(0.0);
+        if crate::cancel::is_cancelled() {
+            // hold 的 Drop 会补发抬起，不会把鼠标留在按下状态。
+            return Err(crate::cancel::cancelled("win_drag_path"));
+        }
+        let due = deadlines.get(idx).copied().unwrap_or(0.0);
+        // from_secs_f64 对 NaN / 负值 / inf 会 panic（release 下 panic=abort，引擎当场消失），
+        // 所以在这里最后兜一道，宁可当成 0ms。
+        let due = if due.is_finite() { due.clamp(0.0, PATH_MAX_REPLAY_MS) } else { 0.0 };
         sleep_until(clock + Duration::from_secs_f64(due / 1000.0));
         match *step {
             PathStep::Move { x, y, wob, travel } => {
@@ -1096,12 +1216,14 @@ pub fn drag_path(
                 last_pos = (px, py);
             }
             PathStep::Down => {
-                send_inputs(&[mouse_input(0, 0, 0, down_flag)])?;
+                hold = Some(ButtonHold::down((down_flag, up_flag))?);
                 std::thread::sleep(Duration::from_millis(PATH_DOWN_SETTLE_MS));
             }
             PathStep::Up => {
                 std::thread::sleep(Duration::from_millis(CLICK_HOLD_MS));
-                send_inputs(&[mouse_input(0, 0, 0, up_flag)])?;
+                if let Some(mut h) = hold.take() {
+                    h.release()?;
+                }
             }
         }
     }
@@ -1127,6 +1249,44 @@ pub fn drag_path(
     })
 }
 
+/// 「鼠标按键按下、尚未抬起」的守卫。
+///
+/// 为什么要有它：按下和抬起是两次独立的 SendInput。中间任何一步报错（目标进程被杀、
+/// UIPI 拦截、线程 panic）都会让调用方直接 return，抬起就漏发了 —— 用户的鼠标会一直
+/// 卡在按下状态，整个桌面都在框选。Drop 里补发抬起是唯一可靠的兜底。
+struct ButtonHold {
+    up_flag: u32,
+    released: bool,
+}
+
+impl ButtonHold {
+    /// 发一次按下；成功了才返回守卫（失败了根本没按下，不需要抬）。
+    fn down(flags: (u32, u32)) -> EngineResult<Self> {
+        let (down_flag, up_flag) = flags;
+        send_inputs(&[mouse_input(0, 0, 0, down_flag)])?;
+        Ok(Self { up_flag, released: false })
+    }
+
+    /// 正常抬起。失败时保守地认为"没抬成"，Drop 会再试一次。
+    fn release(&mut self) -> EngineResult<()> {
+        if self.released {
+            return Ok(());
+        }
+        send_inputs(&[mouse_input(0, 0, 0, self.up_flag)])?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for ButtonHold {
+    fn drop(&mut self) {
+        if !self.released {
+            // 兜底抬起：这里已经没机会把错误交给调用方了，只能尽力而为。
+            let _ = send_inputs(&[mouse_input(0, 0, 0, self.up_flag)]);
+            self.released = true;
+        }
+    }
+}
 /// 鼠标按键对应的 (按下标志, 抬起标志)。
 fn mouse_button_flags(button: MouseButton) -> (u32, u32) {
     match button {
@@ -1410,14 +1570,12 @@ pub fn press(
     }
     ensure_keyboard_reaches(ctx)?;
 
-    // 修饰键按住期间任何一步失败都必须补抬起，否则用户会碰到"Ctrl 一直按着"
-    // 的卡键状态（实测过一次，用户键盘行为会变得莫名其妙）。
+    // 修饰键和主键都各用一个守卫：修饰键按住期间/主键按下期间任何一步失败，
+    // Drop 都会补发抬起。旧实现只在失败分支里 release_keys(mods)，主键本身会卡住
+    // （审查第 08 条）。
+    let mut mod_hold: Option<ModHold> = None;
     if !mods.is_empty() {
-        let downs: Vec<INPUT> = mods.iter().map(|vk| key_event_hardware(*vk, false)).collect();
-        if let Err(err) = send_inputs(&downs) {
-            let _ = release_keys(&mods);
-            return Err(err);
-        }
+        mod_hold = Some(ModHold::down(&mods)?);
         // 留时间让目标进程真的"看到"修饰键按住，见 MOD_HOLD_MS 的说明。
         std::thread::sleep(std::time::Duration::from_millis(MOD_HOLD_MS));
     }
@@ -1428,27 +1586,94 @@ pub fn press(
         }
         // 绝不能把 down/up 塞进同一批 SendInput：那是 0ms 的按下-抬起，
         // 逐帧轮询键盘状态的游戏两帧之间永远看到"没按"，整键消失。
-        if let Err(err) = send_inputs(&[key_event_hardware(vk, false)]) {
-            let _ = release_keys(&mods);
-            return Err(err);
-        }
+        let mut key = KeyHold::down(vk)?;
         std::thread::sleep(std::time::Duration::from_millis(KEY_HOLD_MS));
-        if let Err(err) = send_inputs(&[key_event_hardware(vk, true)]) {
-            let _ = release_keys(&mods);
-            return Err(err);
-        }
+        key.release()?;
     }
-    if !mods.is_empty() {
+    if mod_hold.is_some() {
         // 松开修饰键之前也要留间隔，否则组合键的"先按后放"顺序在目标侧会错位。
         std::thread::sleep(std::time::Duration::from_millis(MOD_HOLD_MS));
     }
-    release_keys(&mods)?;
+    if let Some(mut held) = mod_hold.take() {
+        held.release()?;
+    }
 
     let (cursor_ok, focus_ok) = guard.restore();
     guard.audit(&mut ctx.warnings, cursor_ok, focus_ok);
     Ok((Delivery::SendInput, client, started.elapsed().as_millis() as u64))
 }
 
+/// 「键盘修饰键按住、尚未抬起」的守卫。
+///
+/// 和 ButtonHold 同理：修饰键按住期间任何一步返回 Err，Blocking 场景下用户会碰到
+/// “Ctrl 一直按着”的卡键状态。Drop 里补一次抬起，最坏情况是抬起失败（那也只是
+/// 原来的行为）。
+struct ModHold {
+    vks: Vec<u16>,
+    released: bool,
+}
+
+impl ModHold {
+    fn down(vks: &[u16]) -> EngineResult<Self> {
+        let downs: Vec<INPUT> = vks.iter().map(|vk| key_event_hardware(*vk, false)).collect();
+        send_inputs(&downs)?;
+        Ok(Self { vks: vks.to_vec(), released: false })
+    }
+
+    fn release(&mut self) -> EngineResult<()> {
+        if self.released {
+            return Ok(());
+        }
+        // 抬起按倒序：与按下顺序相反，组合键在目标侧才看到“先按后放”。
+        let ups: Vec<INPUT> = self.vks.iter().rev().map(|vk| key_event_hardware(*vk, true)).collect();
+        send_inputs(&ups)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for ModHold {
+    fn drop(&mut self) {
+        if !self.released {
+            let ups: Vec<INPUT> = self.vks.iter().rev().map(|vk| key_event_hardware(*vk, true)).collect();
+            let _ = send_inputs(&ups);
+            self.released = true;
+        }
+    }
+}
+
+/// 「主按键按下、尚未抬起」的守卫。
+///
+/// 审查第 08 条：旧实现里主键抬起失败只 release_keys(mods)，主键本身留在按下状态。
+struct KeyHold {
+    vk: u16,
+    released: bool,
+}
+
+impl KeyHold {
+    fn down(vk: u16) -> EngineResult<Self> {
+        send_inputs(&[key_event_hardware(vk, false)])?;
+        Ok(Self { vk, released: false })
+    }
+
+    fn release(&mut self) -> EngineResult<()> {
+        if self.released {
+            return Ok(());
+        }
+        send_inputs(&[key_event_hardware(self.vk, true)])?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for KeyHold {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = send_inputs(&[key_event_hardware(self.vk, true)]);
+            self.released = true;
+        }
+    }
+}
 /// 逐个抬起修饰键（倒序）。
 fn release_keys(mods: &[u16]) -> EngineResult<()> {
     if mods.is_empty() {
@@ -1841,7 +2066,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scancode_flags_plain_down() {
+    fn replay_timeline_uses_absolute_timestamps() {
+    // 两笔，第二笔从录制的 400ms 开始（绝对时间轴）。旧实现会在 400 之上再叠
+    // 上一笔的末时间戳（20）和笔间飞行时间，第二笔被推后到 420+，回放越来越慢。
+    let strokes = vec![vec![(0, 0), (10, 0)], vec![(50, 0), (60, 0)]];
+    let times = vec![Some(vec![0.0, 20.0]), Some(vec![400.0, 420.0])];
+    let p = build_path_plan(&strokes, &times, false);
+    let downs: Vec<usize> = p
+        .plan
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, PathStep::Down))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(downs.len(), 2, "两笔应该各有一个 Down");
+    let d0 = p.nominal[downs[0]].expect("第一笔必须有时间戳");
+    let d1 = p.nominal[downs[1]].expect("第二笔必须有时间戳");
+    assert_eq!(d0, 0.0);
+    assert_eq!(d1, 400.0, "第二笔必须从绝对 400ms 开始，不能累加上一笔的时长");
+    // 名义时间表必须单调不减（注入循环按它 sleep_until）。
+    let mut last = -1.0;
+    for t in p.nominal.iter().flatten() {
+        assert!(*t >= last, "时间轴倒退了: {last} -> {t}");
+        last = *t;
+    }
+    // 计划表每一步都要有截止时刻，否则 timed 模式会被关掉。
+    assert!(p.nominal.iter().all(|v| v.is_some()));
+    assert_eq!(p.plan.len(), p.cum.len());
+}
+
+fn times_sane_accepts_recorded_shape() {
+    // win_record 给出的形状：每笔内单调、整段递增，第一笔从 0 开始。
+    let strokes = vec![vec![(0.0, 0.0), (1.0, 1.0)], vec![(5.0, 5.0), (6.0, 6.0)]];
+    let times = vec![vec![0.0, 20.0], vec![400.0, 420.0]];
+    assert!(times_sane(&times, &strokes));
+}
+
+fn times_sane_rejects_bad_values() {
+    let strokes = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
+    assert!(!times_sane(&vec![vec![f64::NAN, 20.0]], &strokes), "NaN 必须拒绝");
+    assert!(!times_sane(&vec![vec![0.0, f64::INFINITY]], &strokes), "inf 必须拒绝");
+    assert!(!times_sane(&vec![vec![-1.0, 20.0]], &strokes), "负数必须拒绝");
+    assert!(!times_sane(&vec![vec![50.0, 20.0]], &strokes), "时间倒退必须拒绝");
+    assert!(!times_sane(&vec![vec![0.0, 1e9]], &strokes), "超过硬上限必须拒绝");
+}
+
+fn scancode_flags_plain_down() {
         // KEYEVENTF_SCANCODE = 0x0008
         assert_eq!(scancode_flags(false, false), 0x0008);
     }

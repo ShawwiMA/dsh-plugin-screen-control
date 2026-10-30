@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-screen-control",
-  "version": "0.2.4",
-  "description": "DSH 屏幕操控插件：TypeScript 薄壳 + Rust 常驻引擎。观察与操作后台窗口，不激活前台窗口。",
+  "version": "0.2.5",
+  "description": "DSH 屏幕操控插件：TypeScript 薄壳 + Rust 常驻引擎。观察不抢前台；操作用 SendInput 真注入，会移动光标、可能临时激活目标窗口，并在结束时还原。",
   "type": "module",
   "main": "lib/index.js",
   "files": [
@@ -20,6 +20,7 @@
     "check-engine": "node scripts/sync-engine.mjs --check",
     "selfcheck": "node scripts/selfcheck.mjs",
     "acceptance": "node scripts/acceptance.mjs",
+    "acceptance:strict": "node scripts/acceptance.mjs --strict",
     "build:testbed": "gcc -O2 -mwindows -o scripts/testbed-window.exe scripts/testbed-window.c -luser32 -lgdi32",
     "link": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/link-into-profile.ps1",
     "prepack": "node scripts/sync-engine.mjs --check"

@@ -561,11 +561,19 @@ async function run() {
   }
 
   const failed = results.filter((r) => !r.ok)
+  const strict = process.argv.includes('--strict')
   console.log('')
   if (failure) console.log(`致命错误: ${failure.message}`)
   console.log(`结果:${failed.length} 项失败,${skips.length} 项跳过,${results.length} 项检查`)
   if (failed.length) for (const f of failed) console.log(`  - 失败 ${f.name}: ${f.detail}`)
   for (const s of skips) console.log(`  - 跳过 ${s}`)
+  // --strict：有跳过项也算不通过。默认允许跳过（本机没装 OCR 语言包之类的
+  // 环境限制很常见），但 CI 里请务必带 --strict，否则"关键验收项被跳过"
+  // 会和"全部通过"返回同一个退出码（GPT 审查第 16 条）。
+  if (strict && skips.length > 0) {
+    console.log('--strict 模式下不接受任何跳过项：请补齐环境后重跑')
+    process.exit(1)
+  }
   process.exit(failed.length === 0 && !failure ? 0 : 1)
 }
 

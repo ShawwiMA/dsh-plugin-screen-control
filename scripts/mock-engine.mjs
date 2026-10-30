@@ -171,6 +171,119 @@ function makeResult(method, params) {
         warnings: [],
       }
 
+    case 'win_launch':
+      return {
+        pid: 55221,
+        path: params.path ?? 'notepad.exe',
+        args: params.args ?? [],
+        still_running: true,
+        checked_after_ms: 30,
+        warnings: [],
+      }
+
+    case 'win_window_state':
+      return {
+        hwnd: params.hwnd ?? 1002,
+        action: params.action ?? 'maximize',
+        is_visible: true,
+        is_minimized: false,
+        is_maximized: true,
+        is_fullscreen: false,
+        is_topmost: false,
+        rect: { x: 1100, y: 200, w: 360, h: 560 },
+        style: 0x00cf0000,
+        ex_style: 0,
+        warnings: [],
+      }
+
+    case 'win_drag':
+      return {
+        delivered: 'sendinput',
+        target_hwnd: params.hwnd ?? 1002,
+        from_screen: { x: params.from_x ?? 100, y: params.from_y ?? 120 },
+        to_screen: { x: params.to_x ?? 200, y: params.to_y ?? 220 },
+        steps: params.steps ?? 24,
+        duration_ms: params.duration_ms ?? 400,
+        distance_px: 141.4,
+        effect: null,
+        warnings: [],
+      }
+
+    case 'win_drag_path':
+      return {
+        delivered: 'sendinput',
+        target_hwnd: params.hwnd ?? 1002,
+        strokes: 1,
+        points: 120,
+        planned_ms: 300,
+        duration_ms: 312,
+        path_px: 250.5,
+        max_step_px: 2.0,
+        start_screen: { x: 380, y: 400 },
+        end_screen: { x: 380, y: 400 },
+        timer_1ms: true,
+        timed: false,
+        effect: null,
+        warnings: [],
+      }
+
+    case 'win_record':
+      return {
+        duration_ms: 1000,
+        samples: 120,
+        hz: 120,
+        strokes: [{ points: [[1, 2], [3, 4]], times_ms: [0, 20] }],
+        total_px: 2.828,
+        warnings: [],
+      }
+
+    case 'win_wait':
+      return {
+        condition: params.condition ?? 'window',
+        matched: false,
+        timed_out: true,
+        waited_ms: 20,
+        polls: 2,
+        timeout_ms: 20,
+        warnings: [],
+      }
+
+    case 'win_ocr':
+      return {
+        text: 'mock 识别文本',
+        lines: [{ text: 'mock', rect: { x: 0, y: 0, w: 40, h: 20 } }],
+        language: 'zh-Hans-CN',
+        available_languages: ['zh-Hans-CN'],
+        origin: { x: 0, y: 0 },
+        width: 200,
+        height: 100,
+        ocr_ms: 5,
+        capture_ms: 3,
+        backend: 'mock',
+      }
+
+    case 'win_web_cdp':
+      return {
+        host: params.host ?? '127.0.0.1',
+        port: params.port ?? 9222,
+        ws_url: 'ws://127.0.0.1:9222/devtools/page/mock',
+        id: 1,
+        result: { title: 'mock' },
+        raw: { id: 1, result: { title: 'mock' } },
+        events: [],
+        elapsed_ms: 6,
+      }
+
+    case 'win_image_trace':
+      return {
+        strokes: [{ points: [[0, 0], [10, 10]] }],
+        strokes_total: 1,
+        points_total: 2,
+        source: { width: 100, height: 100 },
+        elapsed_ms: 30,
+        warnings: [],
+      }
+
     case 'win_press':
     case 'win_scroll':
       return {

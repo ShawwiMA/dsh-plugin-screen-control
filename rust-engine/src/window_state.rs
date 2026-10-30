@@ -168,7 +168,9 @@ fn enter_fullscreen(hwnd: HWND, raw: u64, warnings: &mut Vec<String>) -> EngineR
 }
 
 fn exit_fullscreen(hwnd: HWND, raw: u64, warnings: &mut Vec<String>) -> EngineResult<()> {
-    let record = saved().lock().remove(&raw);
+    // 先取记录、等恢复**成功**之后才删：中途失败（窗口拒绝改样式）时记录必须还在，
+    // 否则用户就永久丢失了原始样式，再也退不回正常窗口。
+    let record = saved().lock().get(&raw).copied();
     let rect = dpi::window_rect(hwnd).unwrap_or_default();
     match record {
         Some(s) => {
@@ -184,6 +186,7 @@ fn exit_fullscreen(hwnd: HWND, raw: u64, warnings: &mut Vec<String>) -> EngineRe
             if s.was_maximized {
                 show(hwnd, SW_MAXIMIZE)?;
             }
+            saved().lock().remove(&raw);
             Ok(())
         }
         None => {
@@ -224,6 +227,16 @@ fn set_style(hwnd: HWND, style: i32, ex_style: i32) -> EngineResult<()> {
     if got != style {
         return Err(EngineError::other(format!(
             "设置窗口样式无效：期望 {style:#x}，回读 {got:#x}（该窗口可能禁止外部改样式）"
+        )));
+    }
+    // 扩展样式也回读。WS_EX_TOPMOST 位除外：它只能由 SetWindowPos 设置，用
+    // SetWindowLong 写进去是文档明确不支持的行为（写也白写），不能当失败。
+    let got_ex = window::ex_style(hwnd);
+    let mask = !(WS_EX_TOPMOST as i32);
+    if (got_ex & mask) != (ex_style & mask) {
+        return Err(EngineError::other(format!(
+            "设置窗口扩展样式无效：期望 {:#x}，回读 {got_ex:#x}（该窗口可能禁止外部改样式）",
+            ex_style & mask
         )));
     }
     Ok(())

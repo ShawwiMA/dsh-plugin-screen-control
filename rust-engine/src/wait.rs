@@ -24,7 +24,12 @@ use crate::protocol::{
     CaptureBackend, Point, Rect, WaitCondition, WaitParams, WaitResult, WinInfo, WindowFilter,
     defaults,
 };
-use crate::{capture, dpi, ocr, window};
+use crate::{capture, dpi, ocr, ocr_worker, window};
+
+/// 图片文件字节上限：再大的"模板"不可能是屏幕上一小块。
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// 解码后的像素数上限（1 亿像素）。超出直接拒绝，不解码进内存。
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
 pub fn wait(p: &WaitParams) -> EngineResult<WaitResult> {
     let timeout_ms = p
@@ -88,6 +93,10 @@ pub fn wait(p: &WaitParams) -> EngineResult<WaitResult> {
 
     loop {
         polls += 1;
+        // 取消位：调用方 aborted 时控制管道会写进来，这里停在轮询边界退出。
+        if crate::cancel::is_cancelled() {
+            return Err(crate::cancel::cancelled("win_wait"));
+        }
         match poll_once(p, matcher.as_mut(), &mut best_score) {
             Ok(Some(found)) => {
                 hit = Some(found);
@@ -253,7 +262,15 @@ fn poll_text(p: &WaitParams) -> EngineResult<Option<Hit>> {
     let needle = p.text.clone().unwrap_or_default();
     let case_sensitive = p.case_sensitive.unwrap_or(false);
 
-    let outcome = ocr::capture_and_recognize(hwnd, Some(region), p.language.as_deref(), false)?;
+    // 和 win_ocr 一样走隔离子进程：wait(text) 是轮询，每次都在引擎进程里跑整屏
+    // WinRT OCR，只要有一次崩掉整个引擎就没了。
+    let outcome = ocr_worker::capture_and_recognize_isolated(
+        hwnd.map(window::to_u64),
+        Some(region),
+        p.language.as_deref(),
+        false,
+        ocr_worker::DEFAULT_TIMEOUT_MS,
+    )?;
     let haystack = if case_sensitive { outcome.text.clone() } else { outcome.text.to_lowercase() };
     let needle_cmp = if case_sensitive { needle.clone() } else { needle.to_lowercase() };
 
@@ -342,6 +359,15 @@ impl Matcher {
         if !p.is_file() {
             return Err(EngineError::not_found(format!("模板文件不存在或不是文件: {path}")));
         }
+        // 先卡文件大小再解码：解码一张 500MP 的 PNG 会把内存和 CPU 都吃满，
+        // 而模板匹配本来就不需要这么大的图（屏幕区域再大也就几百万像素）。
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_IMAGE_FILE_BYTES {
+            return Err(EngineError::invalid(format!(
+                "模板文件 {size} 字节，超过 {} 字节上限",
+                MAX_IMAGE_FILE_BYTES
+            )));
+        }
         let img = image::open(p).map_err(|e| {
             EngineError::invalid(format!("模板图片解码失败（{path}）：{e}（只支持 PNG 等常见格式）"))
         })?;
@@ -349,6 +375,11 @@ impl Matcher {
         let (w, h) = rgba.dimensions();
         if w == 0 || h == 0 {
             return Err(EngineError::invalid("模板图片尺寸为 0"));
+        }
+        if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+            return Err(EngineError::invalid(format!(
+                "模板图片 {w}x{h} 超过 {MAX_IMAGE_PIXELS} 像素上限",
+            )));
         }
         let gray = to_gray(rgba.as_raw());
         let tpl = if (scale - 1.0).abs() > f64::EPSILON {

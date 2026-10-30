@@ -16,6 +16,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod capture;
+mod cancel;
 mod cdp;
 mod cli;
 mod dpi;
@@ -55,6 +56,12 @@ use protocol::{
 
 /// 引擎版本号。TS 侧用它判断协议兼容性，改动协议时要一起动。
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 快照 TTL 上限（10 分钟）。再长既没有真实用途，也会让 expires 在 i64 上溢出。
+const MAX_SNAPSHOT_TTL_MS: u64 = 600_000;
+/// 外部图片文件字节上限（win_image_trace 的 path 入参）。
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// 解码后像素数上限（1 亿像素）。
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// 进程启动时刻，用于 engine_ping.uptime_ms。
 static STARTED: OnceLock<Instant> = OnceLock::new();
@@ -138,6 +145,12 @@ fn main() {
         }
     };
 
+    // 取消控制管道：独立线程，收 `{"cancel": id}` 并写取消位。
+    // --once 模式（自检/一次性冒烟）不需要，跳过。
+    if !args.once {
+        ipc::spawn_control_pipe(&args.pipe);
+    }
+
     let result = runtime.block_on(async move {
         if args.once {
             ipc::serve_once(&args.pipe, handle_request).await
@@ -169,6 +182,8 @@ fn main() {
 /// 拿不到 error.code，也没法决定要不要重试。
 pub fn handle_request(id: u64, method: &str, params: &Map<String, Value>) -> Frame {
     let started = Instant::now();
+    // 记下当前请求 id：长操作里的取消检查靠它认"取消的是不是这一条"。
+    cancel::begin(id);
     let outcome = dispatch(method, params);
     let elapsed = started.elapsed().as_millis();
 
@@ -322,7 +337,15 @@ fn win_capture(params: &Map<String, Value>) -> EngineResult<Value> {
         let timer = capture::Timer::start();
         let raw = capture::capture(hwnd, region, backend)?;
         let capture_ms = timer.elapsed_ms();
-        let outcome = ocr::recognize(&raw.rgba, raw.width, raw.height, p.ocr_language.as_deref())?;
+        // OCR 必须留在隔离子进程里跑：整屏 WinRT OCR 会让引擎进程 0xC0000005 退出，
+        // 这条路径和 win_ocr 是同一条，不能因为「图已经在手上」就在进程内直接识别。
+        let outcome = ocr_worker::recognize_rgba_isolated(
+            &raw.rgba,
+            raw.width,
+            raw.height,
+            p.ocr_language.as_deref(),
+            ocr_worker::DEFAULT_TIMEOUT_MS,
+        )?;
         let result = capture::finalize(raw, max_dim, format, capture_ms)?;
         let (w, h) = (result.width, result.height);
         let mut value = to_value(result)?;
@@ -385,6 +408,9 @@ fn win_observe(params: &Map<String, Value>) -> EngineResult<Value> {
     if ttl_ms == 0 {
         return Err(EngineError::invalid("snapshot_ttl_ms 必须大于 0"));
     }
+    // 上限：快照表是全局的，一个超长 TTL（比如 u64::MAX）会让"过期"永远等不到，
+    // 并且 expires = created + ttl 在 i64 上会溢出。10 分钟足够覆盖任何真实交互。
+    let ttl_ms = ttl_ms.min(MAX_SNAPSHOT_TTL_MS);
 
     let tree = uia::observe(hwnd, &p)?;
 
@@ -821,10 +847,26 @@ fn win_image_trace(params: &Map<String, Value>) -> EngineResult<Value> {
     // 1) 图源二选一：文件 或 自截（自截会顺带登记 shot，坐标可直接喂给 win_drag_path）
     let (rgba, iw, ih, shot_info) = match p.path.as_deref() {
         Some(path) => {
+            // 先看文件大小再读：一张几百 MB 的"图片"能把引擎的内存直接吃光。
+            let size = std::fs::metadata(path)
+                .map(|m| m.len())
+                .map_err(|e| EngineError::invalid(format!("读不到图片 {path}：{e}")))?;
+            if size > MAX_IMAGE_FILE_BYTES {
+                return Err(EngineError::invalid(format!(
+                    "图片 {path} 有 {size} 字节，超过 {MAX_IMAGE_FILE_BYTES} 字节上限"
+                )));
+            }
             let bytes = std::fs::read(path)
                 .map_err(|e| EngineError::invalid(format!("读不到图片 {path}：{e}")))?;
             let img = image::load_from_memory(&bytes)
                 .map_err(|e| EngineError::invalid(format!("图片解码失败 {path}：{e}")))?;
+            if (img.width() as u64) * (img.height() as u64) > MAX_IMAGE_PIXELS {
+                return Err(EngineError::invalid(format!(
+                    "图片 {path} 是 {}x{}，超过 {MAX_IMAGE_PIXELS} 像素上限",
+                    img.width(),
+                    img.height()
+                )));
+            }
             let buf = img.to_rgba8();
             let (w, h) = (buf.width(), buf.height());
             (buf.into_raw(), w, h, None)
@@ -1144,4 +1186,20 @@ fn to_value<T: serde::Serialize>(value: T) -> EngineResult<Value> {
 #[allow(dead_code)]
 fn empty_object() -> Value {
     json!({})
+}
+
+
+#[cfg(test)]
+mod build_config_tests {
+    /// 审查第 18 条：默认关 UIA、开 OCR 是**刻意的默认值**，不是遗漏。
+    ///
+    /// - OCR 必须默认开：win_ocr / win_wait(text) 都依赖它，关掉等于少两个工具。
+    /// - UIA 必须默认关：uiautomation 0.25 内部有 unwrap，目标进程无响应时会 panic，
+    ///   只有 `--features uia` 的增强版才开（配套 release-uia profile 的 unwind）。
+    /// 这条测试把"默认值"钉住：谁改 Cargo.toml 的默认 feature，这里会红。
+    #[test]
+    fn default_build_has_ocr_but_not_uia() {
+        assert!(cfg!(feature = "ocr"), "默认构建必须带 OCR");
+        assert!(!cfg!(feature = "uia"), "UIA 不能进默认构建");
+    }
 }

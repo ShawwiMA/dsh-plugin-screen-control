@@ -228,6 +228,7 @@ fn http_request(
     path: &str,
     timeout: Duration,
 ) -> EngineResult<(u16, String)> {
+    ensure_loopback(host, "host")?;
     let addr = format!("{host}:{port}");
     let socket = resolve(&addr)?;
     let mut stream = TcpStream::connect_timeout(&socket, timeout).map_err(|e| connect_err(&addr, e))?;
@@ -412,6 +413,27 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// 只允许连本机回环。
+///
+/// 为什么必须有：CDP 调试端口是「谁能连上谁就能控制浏览器」的接口。模型（或提示词
+/// 注入）只要把 host 改成公网地址，就能让引擎把浏览器控制权交出去，甚至拿它当跳板
+/// 探测内网。所以把目标锁死在回环：localhost / 127.0.0.0/8 / ::1；要连非本机的
+/// 浏览器，用户自己用 SSH 端口转发到 127.0.0.1，绝不接受引擎直连。
+fn ensure_loopback(host: &str, field: &str) -> EngineResult<()> {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => Ok(()),
+        Ok(_) => Err(EngineError::invalid(format!(
+            "{field} 只允许本机回环地址（localhost / 127.0.0.1 / ::1），收到 {host}。调试端口等于浏览器控制权，不接受指向非本机的连接；需要连远端请自行用 SSH 端口转发。",
+        ))),
+        Err(_) => Err(EngineError::invalid(format!(
+            "{field} 不是合法的本机地址：{host}（只接受 localhost / 127.0.0.1 / ::1）",
+        ))),
+    }
+}
 fn resolve(addr: &str) -> EngineResult<std::net::SocketAddr> {
     let mut iter = addr
         .to_socket_addrs()
@@ -433,6 +455,7 @@ fn connect_err(addr: &str, e: std::io::Error) -> EngineError {
 // ---------------------------------------------------------------------------
 
 fn ws_connect(host: &str, port: u16, path: &str, timeout: Duration) -> EngineResult<TcpStream> {
+    ensure_loopback(host, "ws_url 里的 host")?;
     let addr = format!("{host}:{port}");
     let socket = resolve(&addr)?;
     let mut stream = TcpStream::connect_timeout(&socket, timeout).map_err(|e| connect_err(&addr, e))?;

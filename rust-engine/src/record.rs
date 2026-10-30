@@ -40,8 +40,14 @@ pub fn record(p: &RecordParams) -> EngineResult<RecordResult> {
     let mut samples: u32 = 0;
     let mut cur: Option<RecordedStroke> = None;
     let mut hit_limit = false;
+    // max_points 是**整次录制**的上限，不是单笔：旧实现只比当前笔的长度，
+    // 多笔时总点数可以远超上限（60s × 500Hz 能到 3 万），下游回放要按这个规模备内存。
+    let mut total_pts: usize = 0;
 
     while started.elapsed() < duration {
+        if crate::cancel::is_cancelled() {
+            return Err(crate::cancel::cancelled("win_record"));
+        }
         let tick_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut pt = POINT { x: 0, y: 0 };
         // SAFETY: pt 是栈上已初始化的 POINT；GetAsyncKeyState 只读键盘状态。
@@ -54,12 +60,14 @@ pub fn record(p: &RecordParams) -> EngineResult<RecordResult> {
             match (&mut cur, down) {
                 (None, true) => {
                     cur = Some(RecordedStroke { points: vec![now], times_ms: vec![tick_ms] });
+                    total_pts += 1;
                 }
                 (Some(s), true) => {
                     let last = *s.points.last().unwrap();
                     if (last[0] - now[0]).abs() > 0.01 || (last[1] - now[1]).abs() > 0.01 {
                         s.points.push(now);
                         s.times_ms.push(tick_ms);
+                        total_pts += 1;
                     }
                 }
                 (Some(_), false) => {
@@ -71,8 +79,7 @@ pub fn record(p: &RecordParams) -> EngineResult<RecordResult> {
                 }
                 (None, false) => {}
             }
-            let reached = cur.as_ref().map(|s| s.points.len() >= max_points).unwrap_or(false);
-            if reached {
+            if total_pts >= max_points {
                 hit_limit = true;
                 break;
             }
@@ -87,7 +94,7 @@ pub fn record(p: &RecordParams) -> EngineResult<RecordResult> {
     }
 
     if hit_limit {
-        warnings.push(format!("采样点数达到上限 {max_points}，提前结束录制"));
+        warnings.push(format!("采样总点数达到上限 {max_points}（整次录制），提前结束"));
     }
     if strokes.is_empty() {
         warnings.push(

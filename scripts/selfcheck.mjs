@@ -15,7 +15,7 @@
  * 退出码:0 全部通过(允许有 SKIP);1 有失败项。
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -243,6 +243,46 @@ try {
   const scrolled = await runTool('win_scroll', { hwnd: 1002, delta: -360 })
   check('win_scroll 走通', typeof scrolled?.delivered === 'string', `delivered=${scrolled?.delivered}`)
 
+  // 补齐剩余 9 个工具的协议闭环：之前只验证"注册了"，execute 从没在 mock 上跑过，
+  // 结果就是参数名写错、字段名对不上这类问题一路穿到用户手上（GPT 审查第 15 条）。
+  const launched = await runTool('win_launch', { path: 'notepad.exe' })
+  check('win_launch 走通并回报进程是否还活着', typeof launched?.pid === 'number' && launched?.still_running === true, `pid=${launched?.pid}`)
+
+  const winState = await runTool('win_window_state', { hwnd: 1002, action: 'maximize' })
+  check('win_window_state 走通并回报状态回读', winState?.action === 'maximize' && typeof winState?.style === 'number', `action=${winState?.action}`)
+
+  const dragged = await runTool('win_drag', { hwnd: 1002, from_x: 100, from_y: 120, to_x: 200, to_y: 220 })
+  check('win_drag 走通并回报起止点', dragged?.from_screen?.x === 100 && dragged?.to_screen?.x === 200, `steps=${dragged?.steps}`)
+
+  const pathDrawn = await runTool('win_drag_path', {
+    hwnd: 1002,
+    shape: { kind: 'circle', cx: 500, cy: 400, r: 120 },
+  })
+  check('win_drag_path 走通并回报笔数/点数', pathDrawn?.strokes === 1 && typeof pathDrawn?.points === 'number', `points=${pathDrawn?.points} timed=${pathDrawn?.timed}`)
+
+  const recorded = await runTool('win_record', { duration_ms: 100 })
+  check('win_record 走通并带出可重放的时间戳', Array.isArray(recorded?.strokes?.[0]?.times_ms) && recorded.strokes[0].times_ms.length === recorded.strokes[0].points.length)
+
+  const waited = await runTool('win_wait', { condition: 'window', title_contains: '计算器', timeout_ms: 20 })
+  check('win_wait 超时是正常结果（timed_out=true，不是 RPC 错误）', waited?.matched === false && waited?.timed_out === true)
+
+  const ocr = await runTool('win_ocr', { hwnd: 1002 })
+  check('win_ocr 走通并返回逐行结果', typeof ocr?.text === 'string' && Array.isArray(ocr?.lines), `language=${ocr?.language}`)
+
+  const cdp = await runTool('win_web_cdp', { list_targets: true })
+  check('win_web_cdp 走通', typeof cdp?.host === 'string' && typeof cdp?.port === 'number', `${cdp?.host}:${cdp?.port}`)
+
+  const trace = await runTool('win_image_trace', { hwnd: 1002 })
+  check('win_image_trace 走通并返回笔顺', Array.isArray(trace?.strokes) && trace.strokes.length >= 1, `strokes=${trace?.strokes_total}`)
+
+  // 覆盖度自检：EXPECTED_TOOLS 里的每个工具都必须真的 execute 过一次。
+  // 以后加工具忘了加闭环用例，这一条会红，不会偷偷混过去。
+  // 静态扫一遍本文件里出现的 runTool('<name>') 调用，得到"真正 execute 过的"集合。
+  const selfSrc = readFileSync(fileURLToPath(import.meta.url), 'utf8')
+  const exercised = new Set([...selfSrc.matchAll(/runTool\('([a-z_]+)'/g)].map((m) => m[1]))
+  const unexercised = EXPECTED_TOOLS.filter((name) => !exercised.has(name))
+  check('每个已注册工具都有 mock 闭环用例', unexercised.length === 0, unexercised.join(','))
+
   check('引擎 stdout/事件帧被转发到插件日志', pluginLogs.some((line) => line.includes('mock engine received ping') || line.includes('mock-engine: listening on')))
 
   // render 出来的文本必须是模型真能读到的 JSON,不能是空壳。
@@ -308,6 +348,34 @@ if (!enginePath) {
   try {
     const ping = await bridge.call('engine_ping', {}, { timeoutMs: 15_000 })
     check('engine_ping 往返成功', ping?.ok === true, `pid=${ping?.pid} monitors=${ping?.monitor_count}`)
+
+    // 取消链路（审查第 27 条）：长操作被 abort 后引擎必须停在安全边界，且仍然可用。
+    try {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 150)
+      try {
+        await bridge.call(
+          'win_wait',
+          { condition: 'window', title_contains: '__selfcheck_no_such_window__', timeout_ms: 5000, interval_ms: 100 },
+          { signal: ctl.signal, timeoutMs: 15_000 },
+        )
+        fail('取消链路:长操作 abort 后应抛错', '居然正常返回了（说明 abort 没生效）')
+      } catch (error) {
+        check(
+          '取消链路:长操作 abort 后立刻返回 TIMEOUT',
+          error.code === 'TIMEOUT' && /取消/.test(String(error.message)),
+          String(error.message).slice(0, 60),
+        )
+        // 引擎侧处理取消是异步的：等它把 win_wait 收尾，再确认引擎还活着。
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        const after = await bridge.call('engine_ping', {}, { timeoutMs: 15_000 })
+        check('取消之后引擎仍然可用', after?.ok === true)
+      } finally {
+        clearTimeout(timer)
+      }
+    } catch (error) {
+      fail('取消链路', error.message)
+    }
 
     const listed = await bridge.call('win_list_windows', { limit: 5 }, { timeoutMs: 15_000 })
     const windows = Array.isArray(listed?.windows) ? listed.windows : []

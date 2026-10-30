@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-screen-control-engine"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "image",
  "parking_lot",

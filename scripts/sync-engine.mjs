@@ -14,6 +14,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const checkOnly = process.argv.includes('--check');
+// CI / 发布用：要求 target/release 里一定有刚编出来的引擎。
+// 否则 --check 发现不了「bin/ 里的 exe 是旧代码编的」——因为没编就没有比对基线。
+const requireBuilt = process.argv.includes('--require-built');
 const EXE = 'screen-control-engine.exe';
 const shipped = resolve(root, 'bin', EXE);
 const built = resolve(root, 'rust-engine/target/release', EXE);
@@ -43,6 +46,12 @@ const shippedSize = statSync(shipped).size;
 
 // 3. 与 target/release 比对
 if (!existsSync(built)) {
+  if (requireBuilt) {
+    fail(
+      'target/release 里没有引擎（传了 --require-built）：CI / 发布必须先 cargo build --release，' +
+        '不能拿 bin/ 里现成的 exe 顶包 —— 那可能与当前源码不一致。',
+    );
+  }
   ok(`target/release 未编译，跳过 hash 比对（bin 引擎 ${shippedSize} B，${shortSha(shipped)}…）`);
 } else if (shortSha(shipped) === shortSha(built)) {
   ok(`bin 引擎与 target/release 一致（${shippedSize} B，${shortSha(shipped)}…）`);

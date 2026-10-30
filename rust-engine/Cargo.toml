@@ -1,6 +1,6 @@
 [package]
 name = "dsh-screen-control-engine"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 # edition 2024 要求 rustc >= 1.85；这里只声明下限，不含上限。
 # 实际建议用 stable 通道（见 rust-toolchain.toml）。
@@ -35,6 +35,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
+    # 命名管道专用 DACL：管道等于鼠标键盘控制权，不能沿用"进程默认 DACL"。
+    "Win32_Security",
+    "Win32_Security_Authorization",
     # win_web_cdp 生成 Sec-WebSocket-Key 要用系统 CSPRNG（BCryptGenRandom）。
     "Win32_Security_Cryptography",
     # win_type auto 模式的自动剪贴板：OpenClipboard/EmptyClipboard/SetClipboardData 在
