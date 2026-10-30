@@ -36,6 +36,11 @@ jobs:
         working-directory: rust-engine
         run: cargo build --release
 
+      # 发布包里的 exe 必须是"这次从 tag 源码现编出来的"：先同步覆盖 bin，再比对。
+      # （Rust release 产物不可复现，不能拿仓库里提交的 exe 做逐字节基线。）
+      - name: 同步引擎（用现编产物覆盖 bin）
+        run: node scripts/sync-engine.mjs
+
       - name: 引擎版本守卫（现编现比）
         run: node scripts/sync-engine.mjs --check --require-built
 

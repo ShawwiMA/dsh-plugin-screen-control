@@ -25,8 +25,15 @@ jobs:
         working-directory: rust-engine
         run: cargo build --release
 
-      # --require-built：bin/ 里的 exe 必须和刚编出来的产物逐字节一致。
-      # 没有这个开关时，CI 里 target/release 不存在 = 直接跳过比对，等于没查。
+      # 先把刚编出来的引擎同步进 bin/，再逐字节比对。
+      #
+      # 为什么不是直接 --check：Rust 的 release 产物**不是可复现构建**（编译器版本、
+      # 依赖哈希、LTO 都会影响字节），要求 CI 产物和仓库里已提交的 exe 逐字节相同
+      # 必然失败。正确做法是"CI 现编 → 用它覆盖 bin → 再验证 bin 与 target 一致"，
+      # 这样发布出去的引擎一定和源码同一份，也不依赖本地构建环境。
+      - name: 同步引擎（用现编产物覆盖 bin）
+        run: node scripts/sync-engine.mjs
+
       - name: 引擎版本守卫（现编现比）
         run: node scripts/sync-engine.mjs --check --require-built
 
